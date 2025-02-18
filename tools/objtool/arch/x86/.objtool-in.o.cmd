@@ -1,0 +1,1 @@
+cmd_/users/dwearden/linux-4.15-lb/tools/objtool/arch/x86/objtool-in.o :=  ld -r -o /users/dwearden/linux-4.15-lb/tools/objtool/arch/x86/objtool-in.o  /users/dwearden/linux-4.15-lb/tools/objtool/arch/x86/decode.o
