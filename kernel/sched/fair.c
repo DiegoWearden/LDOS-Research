@@ -6975,6 +6975,7 @@ struct lb_env {
     unsigned int should_call_count; // JC explicit instrumentation
     u64 should_total_ns; // JC explicit instrumentation
     u64 should_max_ns; // JC explicit instrumentation
+    unsigned int should_latency_source_mode; // JC explicit instrumentation: 0 none, 1 ml_should, 2 normal_scheduler
 };
 
 /* JC ML CFS LB*/
@@ -7134,6 +7135,12 @@ static
 int can_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int tsk_cache_hot;
+#ifndef CONFIG_JC_SCHED_REPLACE
+    u64 t_normal;
+#ifndef CONFIG_JC_SCHED_TEST
+    u64 dt_normal;
+#endif
+#endif
 
 #ifdef CONFIG_JC_SCHED_TEST
     int ret = 0;         // JC
@@ -7144,6 +7151,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
     env->should_call_count = 0;
     env->should_total_ns = 0;
     env->should_max_ns = 0;
+    env->should_latency_source_mode = 0;
 
     lockdep_assert_held(&env->src_rq->lock);
 
@@ -7208,6 +7216,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
         env->should_total_ns += jc_dt;
         if (jc_dt > env->should_max_ns)
             env->should_max_ns = jc_dt;
+        env->should_latency_source_mode = 1;
         return jc_ret;
     }
 #else
@@ -7221,12 +7230,15 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
         env->should_total_ns += jc_dt;
         if (jc_dt > env->should_max_ns)
             env->should_max_ns = jc_dt;
+        env->should_latency_source_mode = 1;
         return jc_ret;
     }
 #endif
 
+    t_normal = ktime_get_ns();
+
 #ifdef CONFIG_JC_SCHED_TEST
-    t_ori = ktime_get_ns();
+    t_ori = t_normal;
 #endif
 
 	/*
@@ -7248,27 +7260,37 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #ifdef CONFIG_JC_SCHED_TEST
         ret = 1;
 #else
+        dt_normal = ktime_get_ns() - t_normal;
+        env->should_call_count = 1;
+        env->should_total_ns = dt_normal;
+        env->should_max_ns = dt_normal;
+        env->should_latency_source_mode = 2;
         return 1;
 #endif
     }
 
 #ifdef CONFIG_JC_SCHED_TEST
     t_ori = ktime_get_ns() - t_ori;
+    env->should_call_count = 1;
+    env->should_total_ns = t_ori;
+    env->should_max_ns = t_ori;
+    env->should_latency_source_mode = 2;
     // JC
     if (is_jc_sched) {
         u64 t_jc = ktime_get_ns();
         int jc_ret = should_migrate_task(p, env);      
         u64 jc_dt = ktime_get_ns() - t_jc;
-        env->should_call_count++;
-        env->should_total_ns += jc_dt;
-        if (jc_dt > env->should_max_ns)
-            env->should_max_ns = jc_dt;
         printk("can_migrate %d %d", ret, jc_ret);
         printk("cm_time %llu %llu", t_ori, jc_dt);
     }
 	return ret;
 #else
 	schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
+    dt_normal = ktime_get_ns() - t_normal;
+    env->should_call_count = 1;
+    env->should_total_ns = dt_normal;
+    env->should_max_ns = dt_normal;
+    env->should_latency_source_mode = 2;
     return 0;
 #endif  // JC_SCHED_TEST
 
