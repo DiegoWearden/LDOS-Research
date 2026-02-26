@@ -20,6 +20,9 @@ config JC_SCHED_TOGGLE
 config JC_SCHED_REPLACE
     bool "Replace"
 
+config JC_SCHED_SHADOW
+    bool "Shadow"
+
 config JC_SCHED_TEST
     bool "Test"
 
