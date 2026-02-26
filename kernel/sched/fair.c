@@ -6972,6 +6972,9 @@ struct lb_env {
 	struct list_head	tasks;
 
     unsigned int test_aggressive; // JC
+    unsigned int should_call_count; // JC explicit instrumentation
+    u64 should_total_ns; // JC explicit instrumentation
+    u64 should_max_ns; // JC explicit instrumentation
 };
 
 /* JC ML CFS LB*/
@@ -7138,6 +7141,9 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
     env->test_aggressive = 0;
+    env->should_call_count = 0;
+    env->should_total_ns = 0;
+    env->should_max_ns = 0;
 
     lockdep_assert_held(&env->src_rq->lock);
 
@@ -7194,12 +7200,29 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 #ifdef CONFIG_JC_SCHED_REPLACE
     /* printk("JC_SCHED_REPLACE"); */
-    return should_migrate_task(p, env);      
+    {
+        u64 t_jc = ktime_get_ns();
+        int jc_ret = should_migrate_task(p, env);
+        u64 jc_dt = ktime_get_ns() - t_jc;
+        env->should_call_count++;
+        env->should_total_ns += jc_dt;
+        if (jc_dt > env->should_max_ns)
+            env->should_max_ns = jc_dt;
+        return jc_ret;
+    }
 #else
 
 #ifdef CONFIG_JC_SCHED_TOGGLE
-    if (is_jc_sched)
-        return should_migrate_task(p, env);
+    if (is_jc_sched) {
+        u64 t_jc = ktime_get_ns();
+        int jc_ret = should_migrate_task(p, env);
+        u64 jc_dt = ktime_get_ns() - t_jc;
+        env->should_call_count++;
+        env->should_total_ns += jc_dt;
+        if (jc_dt > env->should_max_ns)
+            env->should_max_ns = jc_dt;
+        return jc_ret;
+    }
 #endif
 
 #ifdef CONFIG_JC_SCHED_TEST
@@ -7235,9 +7258,13 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
     if (is_jc_sched) {
         u64 t_jc = ktime_get_ns();
         int jc_ret = should_migrate_task(p, env);      
-        t_jc = ktime_get_ns() - t_jc;
+        u64 jc_dt = ktime_get_ns() - t_jc;
+        env->should_call_count++;
+        env->should_total_ns += jc_dt;
+        if (jc_dt > env->should_max_ns)
+            env->should_max_ns = jc_dt;
         printk("can_migrate %d %d", ret, jc_ret);
-        printk("cm_time %llu %llu", t_ori, t_jc);
+        printk("cm_time %llu %llu", t_ori, jc_dt);
     }
 	return ret;
 #else
