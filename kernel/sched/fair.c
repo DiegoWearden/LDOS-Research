@@ -6971,13 +6971,7 @@ struct lb_env {
 	enum fbq_type		fbq_type;
 	struct list_head	tasks;
 
-    unsigned int test_aggressive; // JC
-    unsigned int should_call_count; // JC explicit instrumentation
-    u64 should_total_ns; // JC explicit instrumentation
-    u64 should_max_ns; // JC explicit instrumentation
-    unsigned int should_latency_source_mode; // JC explicit instrumentation: 0 none, 1 ml_should, 2 normal_scheduler, 3 ml_shadow
-    int ml_can_migrate_decision; // JC explicit instrumentation: ML decision (0/1), -1 if not evaluated
-    int normal_can_migrate_decision; // JC explicit instrumentation: normal decision (0/1), -1 if not evaluated
+	unsigned int test_aggressive; // JC
 };
 
 /* JC ML CFS LB*/
@@ -6985,6 +6979,7 @@ struct lb_env {
 static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int src_nid, dst_nid;
+	int ret;
     s64 delta;
     struct rq *src_rq = env->src_rq;
     struct rq *dst_rq = env->dst_rq;
@@ -7031,7 +7026,11 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 
     data.total_faults = p->total_numa_faults;
 
-    return jc_mlp_main(&data);
+	ret = jc_mlp_main(&data);
+	pr_info_ratelimited("jc_sched: should_migrate_task pid=%d src_cpu=%d dst_cpu=%d ret=%d idle=%d src_len=%u dst_len=%u\n",
+			    p->pid, env->src_cpu, env->dst_cpu, ret, env->idle,
+			    src_rq->nr_running, dst_rq->nr_running);
+	return ret;
 }
 #endif
 
@@ -7137,12 +7136,6 @@ static
 int can_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int tsk_cache_hot;
-#ifndef CONFIG_JC_SCHED_REPLACE
-    u64 t_normal;
-#ifndef CONFIG_JC_SCHED_TEST
-    u64 dt_normal;
-#endif
-#endif
 
 #ifdef CONFIG_JC_SCHED_TEST
     int ret = 0;         // JC
@@ -7150,14 +7143,22 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
 	env->test_aggressive = 0;
-	env->should_call_count = 0;
-	env->should_total_ns = 0;
-	env->should_max_ns = 0;
-	env->should_latency_source_mode = 0;
-	env->ml_can_migrate_decision = -1;
-	env->normal_can_migrate_decision = -1;
 
     lockdep_assert_held(&env->src_rq->lock);
+
+#ifdef CONFIG_JC_SCHED_REPLACE
+	pr_info_once("jc_sched: mode=REPLACE\n");
+#elif defined(CONFIG_JC_SCHED_SHADOW)
+	pr_info_once("jc_sched: mode=SHADOW\n");
+#elif defined(CONFIG_JC_SCHED_TOGGLE)
+	pr_info_once("jc_sched: mode=TOGGLE (is_jc_sched is runtime-controlled)\n");
+#elif defined(CONFIG_JC_SCHED_TEST)
+	pr_info_once("jc_sched: mode=TEST\n");
+#elif defined(CONFIG_JC_SCHED)
+	pr_info_once("jc_sched: mode=UNKNOWN (CONFIG_JC_SCHED enabled)\n");
+#else
+	pr_info_once("jc_sched: mode=DISABLED (CONFIG_JC_SCHED not set)\n");
+#endif
 
 
     /*
@@ -7212,53 +7213,26 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 #ifdef CONFIG_JC_SCHED_SHADOW
 	{
-		u64 t_jc = ktime_get_ns();
-		int jc_ret = should_migrate_task(p, env);
-		u64 jc_dt = ktime_get_ns() - t_jc;
-		env->should_call_count++;
-		env->should_total_ns += jc_dt;
-		if (jc_dt > env->should_max_ns)
-			env->should_max_ns = jc_dt;
-		env->should_latency_source_mode = 3;
-		env->ml_can_migrate_decision = jc_ret;
+		(void)should_migrate_task(p, env);
 	}
 #endif
 
 #ifdef CONFIG_JC_SCHED_REPLACE
     /* printk("JC_SCHED_REPLACE"); */
-		{
-			u64 t_jc = ktime_get_ns();
-			int jc_ret = should_migrate_task(p, env);
-		u64 jc_dt = ktime_get_ns() - t_jc;
-		env->should_call_count++;
-			env->should_total_ns += jc_dt;
-			if (jc_dt > env->should_max_ns)
-				env->should_max_ns = jc_dt;
-			env->should_latency_source_mode = 1;
-			env->ml_can_migrate_decision = jc_ret;
-			return jc_ret;
-		}
+    return should_migrate_task(p, env);
 #else
 
 #ifdef CONFIG_JC_SCHED_TOGGLE
 	    if (is_jc_sched) {
-	        u64 t_jc = ktime_get_ns();
-	        int jc_ret = should_migrate_task(p, env);
-        u64 jc_dt = ktime_get_ns() - t_jc;
-        env->should_call_count++;
-	        env->should_total_ns += jc_dt;
-	        if (jc_dt > env->should_max_ns)
-	            env->should_max_ns = jc_dt;
-	        env->should_latency_source_mode = 1;
-	        env->ml_can_migrate_decision = jc_ret;
-	        return jc_ret;
+	        return should_migrate_task(p, env);
 	    }
 #endif
 
-    t_normal = ktime_get_ns();
+	    pr_info_ratelimited("jc_sched: normal_path entered pid=%d src_cpu=%d dst_cpu=%d idle=%d\n",
+				p->pid, env->src_cpu, env->dst_cpu, env->idle);
 
 #ifdef CONFIG_JC_SCHED_TEST
-    t_ori = t_normal;
+    t_ori = ktime_get_ns();
 #endif
 
 	/*
@@ -7280,47 +7254,29 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #ifdef CONFIG_JC_SCHED_TEST
         ret = 1;
 #else
-        dt_normal = ktime_get_ns() - t_normal;
-#ifndef CONFIG_JC_SCHED_SHADOW
-	        env->should_call_count = 1;
-	        env->should_total_ns = dt_normal;
-	        env->should_max_ns = dt_normal;
-	        env->should_latency_source_mode = 2;
-#endif
-	        env->normal_can_migrate_decision = 1;
+	        pr_info_ratelimited("jc_sched: normal_path decision=1 pid=%d src_cpu=%d dst_cpu=%d\n",
+				    p->pid, env->src_cpu, env->dst_cpu);
 	        return 1;
 #endif
 	    }
 
 #ifdef CONFIG_JC_SCHED_TEST
     t_ori = ktime_get_ns() - t_ori;
-#ifndef CONFIG_JC_SCHED_SHADOW
-	    env->should_call_count = 1;
-	    env->should_total_ns = t_ori;
-	    env->should_max_ns = t_ori;
-	    env->should_latency_source_mode = 2;
-#endif
-	    env->normal_can_migrate_decision = ret;
+	    pr_info_ratelimited("jc_sched: normal_path decision=%d pid=%d src_cpu=%d dst_cpu=%d\n",
+				ret, p->pid, env->src_cpu, env->dst_cpu);
 	    // JC
 	    if (is_jc_sched) {
 	        u64 t_jc = ktime_get_ns();
 	        int jc_ret = should_migrate_task(p, env);      
 	        u64 jc_dt = ktime_get_ns() - t_jc;
-	        env->ml_can_migrate_decision = jc_ret;
 	        printk("can_migrate %d %d", ret, jc_ret);
 	        printk("cm_time %llu %llu", t_ori, jc_dt);
 	    }
 		return ret;
 #else
 	schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
-    dt_normal = ktime_get_ns() - t_normal;
-#ifndef CONFIG_JC_SCHED_SHADOW
-	    env->should_call_count = 1;
-	    env->should_total_ns = dt_normal;
-	    env->should_max_ns = dt_normal;
-	    env->should_latency_source_mode = 2;
-#endif
-	    env->normal_can_migrate_decision = 0;
+	    pr_info_ratelimited("jc_sched: normal_path decision=0 pid=%d src_cpu=%d dst_cpu=%d\n",
+				p->pid, env->src_cpu, env->dst_cpu);
 	    return 0;
 #endif  // JC_SCHED_TEST
 
