@@ -25,6 +25,7 @@ struct jc_lb_data {
 };
 
 int jc_mlp_main(struct jc_lb_data *data);
+int jc_mlp_main_with_score(struct jc_lb_data *data, int *score_permille, int *margin_permille);
 
 #ifdef CONFIG_JC_SCHED_FXDPT
 typedef s32 fxdpt_t;

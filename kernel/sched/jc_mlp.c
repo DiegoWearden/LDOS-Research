@@ -75,7 +75,7 @@ static inline void ReLU(struct matrix *X)
     }
 }
 
-static int forward_pass(struct matrix *input)
+static int forward_pass(struct matrix *input, dtype *raw_output)
 {
     dtype output;
     dtype o1[10] = {0};
@@ -99,14 +99,30 @@ static int forward_pass(struct matrix *input)
     matadd(&out2, &B2, &out2);
 
     output = m1d(&out2, 0);
+    if (raw_output)
+        *raw_output = output;
 
     /* printk("forward_pass output: %08x", ftox(tofloat(output))); */
     return output > ftod(0.5) ? 1 : 0;
 }
 
 #ifdef CONFIG_JC_SCHED_FXDPT
-int jc_mlp_main(struct jc_lb_data *data) {
+static inline int dtype_to_permille(dtype val)
+{
+    return (int)(((s64)val * 1000) >> FXDPT_FBITS);
+}
+
+static inline int dtype_margin_permille(dtype val)
+{
+    dtype diff = val - (FXDPT_ONE >> 1);
+    if (diff < 0)
+        diff = -diff;
+    return (int)(((s64)diff * 1000) >> FXDPT_FBITS);
+}
+
+int jc_mlp_main_with_score(struct jc_lb_data *data, int *score_permille, int *margin_permille) {
     int output;
+    dtype raw_output = 0;
     struct matrix input = {1, NR_FEAT, NULL};
     dtype delta_faults;
 
@@ -133,13 +149,36 @@ int jc_mlp_main(struct jc_lb_data *data) {
         itodtype(data->buddy_hot),
     };
 
-    output = forward_pass(&input);
+    output = forward_pass(&input, &raw_output);
+    if (score_permille)
+        *score_permille = dtype_to_permille(raw_output);
+    if (margin_permille)
+        *margin_permille = dtype_margin_permille(raw_output);
 
     return output;
 }
+
+int jc_mlp_main(struct jc_lb_data *data)
+{
+    return jc_mlp_main_with_score(data, NULL, NULL);
+}
 #else
-int jc_mlp_main(struct jc_lb_data *data) {
+static inline int dtype_to_permille(dtype val)
+{
+    return (int)(val * 1000.0f);
+}
+
+static inline int dtype_margin_permille(dtype val)
+{
+    dtype diff = val - (dtype)0.5;
+    if (diff < 0)
+        diff = -diff;
+    return (int)(diff * 1000.0f);
+}
+
+int jc_mlp_main_with_score(struct jc_lb_data *data, int *score_permille, int *margin_permille) {
     int output;
+    dtype raw_output = 0;
     struct matrix input = {1, NR_FEAT, NULL};
     dtype delta_faults;
 
@@ -168,11 +207,19 @@ int jc_mlp_main(struct jc_lb_data *data) {
         (dtype)data->buddy_hot,
     };
 
-    output = forward_pass(&input);
+    output = forward_pass(&input, &raw_output);
+    if (score_permille)
+        *score_permille = dtype_to_permille(raw_output);
+    if (margin_permille)
+        *margin_permille = dtype_margin_permille(raw_output);
 
     kernel_fpu_end();
 
     return output;
 }
-#endif
 
+int jc_mlp_main(struct jc_lb_data *data)
+{
+    return jc_mlp_main_with_score(data, NULL, NULL);
+}
+#endif

@@ -6972,14 +6972,46 @@ struct lb_env {
 	struct list_head	tasks;
 
 	unsigned int test_aggressive; // JC
+
+	/* JC observability: per-decision diagnostics for can_migrate_task(). */
+	unsigned int jc_should_call_count;
+	u64 jc_should_total_ns;
+	u64 jc_should_max_ns;
+	int jc_should_latency_source_mode;
+	int jc_ml_can_migrate_decision;
+	int jc_normal_can_migrate_decision;
+	unsigned int jc_decision_mismatch;
+	unsigned int jc_fail_reason;
+	int jc_ml_confidence_permille;
+	int jc_ml_margin_permille;
+};
+
+enum jc_sched_source_mode {
+	JC_SCHED_SOURCE_UNKNOWN = 0,
+	JC_SCHED_SOURCE_ML = 1,
+	JC_SCHED_SOURCE_NORMAL = 2,
+	JC_SCHED_SOURCE_SHADOW = 3,
+};
+
+enum jc_sched_fail_reason {
+	JC_SCHED_FAIL_NONE = 0,
+	JC_SCHED_FAIL_THROTTLED = 1,
+	JC_SCHED_FAIL_AFFINITY = 2,
+	JC_SCHED_FAIL_RUNNING = 3,
+	JC_SCHED_FAIL_NORMAL_POLICY = 4,
+	JC_SCHED_FAIL_ML_POLICY = 5,
 };
 
 /* JC ML CFS LB*/
 #ifdef CONFIG_JC_SCHED
-static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
+static inline int should_migrate_task(struct task_struct *p, struct lb_env *env,
+				      int *ml_confidence_permille,
+				      int *ml_margin_permille)
 {
 	int src_nid, dst_nid;
 	int ret;
+	int score_permille = -1;
+	int margin_permille = -1;
     s64 delta;
     struct rq *src_rq = env->src_rq;
     struct rq *dst_rq = env->dst_rq;
@@ -7026,7 +7058,15 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 
     data.total_faults = p->total_numa_faults;
 
-	ret = jc_mlp_main(&data);
+	ret = jc_mlp_main_with_score(&data, &score_permille, &margin_permille);
+	if (ml_margin_permille)
+		*ml_margin_permille = margin_permille;
+	if (ml_confidence_permille) {
+		int conf = (margin_permille < 0) ? -1 : (margin_permille * 2);
+		if (conf > 1000)
+			conf = 1000;
+		*ml_confidence_permille = conf;
+	}
 	pr_info_ratelimited("jc_sched: should_migrate_task pid=%d src_cpu=%d dst_cpu=%d ret=%d idle=%d src_len=%u dst_len=%u\n",
 			    p->pid, env->src_cpu, env->dst_cpu, ret, env->idle,
 			    src_rq->nr_running, dst_rq->nr_running);
@@ -7035,7 +7075,6 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
 
-#ifndef CONFIG_JC_SCHED_REPLACE
 /*
  * Is this task likely cache-hot:
  */
@@ -7127,7 +7166,25 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 	return -1;
 }
 #endif
-#endif  // JC_SCHED_REPLACE
+
+static inline int jc_normal_can_migrate_decision(struct task_struct *p,
+						 struct lb_env *env,
+						 int *tsk_cache_hot)
+{
+	int cache_hot;
+
+	cache_hot = migrate_degrades_locality(p, env);
+	if (cache_hot == -1)
+		cache_hot = task_hot(p, env);
+	if (tsk_cache_hot)
+		*tsk_cache_hot = cache_hot;
+
+	if (cache_hot <= 0 ||
+	    env->sd->nr_balance_failed > env->sd->cache_nice_tries)
+		return 1;
+
+	return 0;
+}
 
 /*
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
@@ -7135,16 +7192,24 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 static
 int can_migrate_task(struct task_struct *p, struct lb_env *env)
 {
-	int tsk_cache_hot;
-
-#ifdef CONFIG_JC_SCHED_TEST
-    int ret = 0;         // JC
-    u64 t_ori;
-#endif
+	int tsk_cache_hot = -1;
+	int normal_decision;
+	int final_decision = 0;
+	bool used_normal_policy = true;
 
 	env->test_aggressive = 0;
+	env->jc_should_call_count = 0;
+	env->jc_should_total_ns = 0;
+	env->jc_should_max_ns = 0;
+	env->jc_should_latency_source_mode = JC_SCHED_SOURCE_UNKNOWN;
+	env->jc_ml_can_migrate_decision = -1;
+	env->jc_normal_can_migrate_decision = -1;
+	env->jc_decision_mismatch = 0;
+	env->jc_fail_reason = JC_SCHED_FAIL_NONE;
+	env->jc_ml_confidence_permille = -1;
+	env->jc_ml_margin_permille = -1;
 
-    lockdep_assert_held(&env->src_rq->lock);
+	lockdep_assert_held(&env->src_rq->lock);
 
 #ifdef CONFIG_JC_SCHED_REPLACE
 	pr_info_once("jc_sched: mode=REPLACE\n");
@@ -7161,15 +7226,17 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
 
-    /*
-     * We do not migrate tasks that are:
+	/*
+	 * We do not migrate tasks that are:
 	 * 1) throttled_lb_pair, or
 	 * 2) cannot be migrated to this CPU due to cpus_allowed, or
 	 * 3) running (obviously), or
 	 * 4) are cache-hot on their current CPU.
 	 */
-	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu))
+	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu)) {
+		env->jc_fail_reason = JC_SCHED_FAIL_THROTTLED;
 		return 0;
+	}
 
 	if (!cpumask_test_cpu(env->dst_cpu, &p->cpus_allowed)) {
 		int cpu;
@@ -7186,8 +7253,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		 * Avoid computing new_dst_cpu for NEWLY_IDLE or if we have
 		 * already computed one in current iteration.
 		 */
-		if (env->idle == CPU_NEWLY_IDLE || (env->flags & LBF_DST_PINNED))
+		if (env->idle == CPU_NEWLY_IDLE || (env->flags & LBF_DST_PINNED)) {
+			env->jc_fail_reason = JC_SCHED_FAIL_AFFINITY;
 			return 0;
+		}
 
 		/* Prevent to re-select dst_cpu via env's cpus */
 		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
@@ -7198,6 +7267,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 			}
 		}
 
+		env->jc_fail_reason = JC_SCHED_FAIL_AFFINITY;
 		return 0;
 	}
 
@@ -7206,81 +7276,84 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 	if (task_running(env->src_rq, p)) {
 		schedstat_inc(p->se.statistics.nr_failed_migrations_running);
+		env->jc_fail_reason = JC_SCHED_FAIL_RUNNING;
 		return 0;
 	}
 
-    env->test_aggressive = 1;
+	env->test_aggressive = 1;
+	normal_decision = jc_normal_can_migrate_decision(p, env, &tsk_cache_hot);
+	env->jc_normal_can_migrate_decision = normal_decision;
+	final_decision = normal_decision;
+	env->jc_should_latency_source_mode = JC_SCHED_SOURCE_NORMAL;
+
+#ifdef CONFIG_JC_SCHED
+	{
+		u64 ml_start_ns;
+		u64 ml_dt;
+		int ml_decision;
+		int ml_confidence_permille = -1;
+		int ml_margin_permille = -1;
+
+		ml_start_ns = ktime_get_ns();
+		ml_decision = should_migrate_task(p, env,
+						&ml_confidence_permille,
+						&ml_margin_permille);
+		ml_dt = ktime_get_ns() - ml_start_ns;
+
+		env->jc_ml_can_migrate_decision = ml_decision;
+		env->jc_should_call_count = 1;
+		env->jc_should_total_ns = ml_dt;
+		env->jc_should_max_ns = ml_dt;
+		env->jc_decision_mismatch = (ml_decision != normal_decision);
+		env->jc_ml_confidence_permille = ml_confidence_permille;
+		env->jc_ml_margin_permille = ml_margin_permille;
 
 #ifdef CONFIG_JC_SCHED_SHADOW
-	{
-		(void)should_migrate_task(p, env);
+		env->jc_should_latency_source_mode = JC_SCHED_SOURCE_SHADOW;
+		final_decision = normal_decision;
+		used_normal_policy = true;
+#elif defined(CONFIG_JC_SCHED_REPLACE)
+		env->jc_should_latency_source_mode = JC_SCHED_SOURCE_ML;
+		final_decision = ml_decision;
+		used_normal_policy = false;
+#elif defined(CONFIG_JC_SCHED_TOGGLE)
+		if (is_jc_sched) {
+			env->jc_should_latency_source_mode = JC_SCHED_SOURCE_ML;
+			final_decision = ml_decision;
+			used_normal_policy = false;
+		} else {
+			env->jc_should_latency_source_mode = JC_SCHED_SOURCE_NORMAL;
+			final_decision = normal_decision;
+			used_normal_policy = true;
+		}
+#elif defined(CONFIG_JC_SCHED_TEST)
+		env->jc_should_latency_source_mode = JC_SCHED_SOURCE_NORMAL;
+		final_decision = normal_decision;
+		used_normal_policy = true;
+#else
+		env->jc_should_latency_source_mode = JC_SCHED_SOURCE_NORMAL;
+		final_decision = normal_decision;
+		used_normal_policy = true;
+#endif
+		}
+#endif
+
+	if (used_normal_policy) {
+		if (final_decision) {
+			if (tsk_cache_hot == 1) {
+				schedstat_inc(env->sd->lb_hot_gained[env->idle]);
+				schedstat_inc(p->se.statistics.nr_forced_migrations);
+			}
+			return 1;
+		}
+		schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
+		env->jc_fail_reason = JC_SCHED_FAIL_NORMAL_POLICY;
+		return 0;
 	}
-#endif
 
-#ifdef CONFIG_JC_SCHED_REPLACE
-    /* printk("JC_SCHED_REPLACE"); */
-    return should_migrate_task(p, env);
-#else
-
-#ifdef CONFIG_JC_SCHED_TOGGLE
-	    if (is_jc_sched) {
-	        return should_migrate_task(p, env);
-	    }
-#endif
-
-	    pr_info_ratelimited("jc_sched: normal_path entered pid=%d src_cpu=%d dst_cpu=%d idle=%d\n",
-				p->pid, env->src_cpu, env->dst_cpu, env->idle);
-
-#ifdef CONFIG_JC_SCHED_TEST
-    t_ori = ktime_get_ns();
-#endif
-
-	/*
-	 * Aggressive migration if:
-	 * 1) destination numa is preferred
-	 * 2) task is cache cold, or
-	 * 3) too many balance attempts have failed.
-	 */
-	tsk_cache_hot = migrate_degrades_locality(p, env);
-	if (tsk_cache_hot == -1)
-		tsk_cache_hot = task_hot(p, env);
-
-	if (tsk_cache_hot <= 0 ||
-	    env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
-		if (tsk_cache_hot == 1) {
-			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
-			schedstat_inc(p->se.statistics.nr_forced_migrations);
-        }
-#ifdef CONFIG_JC_SCHED_TEST
-        ret = 1;
-#else
-	        pr_info_ratelimited("jc_sched: normal_path decision=1 pid=%d src_cpu=%d dst_cpu=%d\n",
-				    p->pid, env->src_cpu, env->dst_cpu);
-	        return 1;
-#endif
-	    }
-
-#ifdef CONFIG_JC_SCHED_TEST
-    t_ori = ktime_get_ns() - t_ori;
-	    pr_info_ratelimited("jc_sched: normal_path decision=%d pid=%d src_cpu=%d dst_cpu=%d\n",
-				ret, p->pid, env->src_cpu, env->dst_cpu);
-	    // JC
-	    if (is_jc_sched) {
-	        u64 t_jc = ktime_get_ns();
-	        int jc_ret = should_migrate_task(p, env);      
-	        u64 jc_dt = ktime_get_ns() - t_jc;
-	        printk("can_migrate %d %d", ret, jc_ret);
-	        printk("cm_time %llu %llu", t_ori, jc_dt);
-	    }
-		return ret;
-#else
-	schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
-	    pr_info_ratelimited("jc_sched: normal_path decision=0 pid=%d src_cpu=%d dst_cpu=%d\n",
-				p->pid, env->src_cpu, env->dst_cpu);
-	    return 0;
-#endif  // JC_SCHED_TEST
-
-#endif  // JC_SCHED_REPLACE
+	if (!final_decision)
+		env->jc_fail_reason = JC_SCHED_FAIL_ML_POLICY;
+	return final_decision;
 }
 
 

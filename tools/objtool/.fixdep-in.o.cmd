@@ -1,1 +1,1 @@
-cmd_/users/dwearden/linux-4.15-lb/tools/objtool/fixdep-in.o :=  ld -r -o /users/dwearden/linux-4.15-lb/tools/objtool/fixdep-in.o  /users/dwearden/linux-4.15-lb/tools/objtool/fixdep.o
+cmd_/home/diego/research/dashboard_app/LDOS-Research/tools/objtool/fixdep-in.o :=  ld -r -o /home/diego/research/dashboard_app/LDOS-Research/tools/objtool/fixdep-in.o  /home/diego/research/dashboard_app/LDOS-Research/tools/objtool/fixdep.o
