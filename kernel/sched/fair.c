@@ -7004,6 +7004,20 @@ enum jc_sched_fail_reason {
 
 /* JC ML CFS LB*/
 #ifdef CONFIG_JC_SCHED
+#define JC_IDLE_PULL_BACKLOG_THRESHOLD 1
+
+static inline bool jc_should_force_idle_pull(const struct lb_env *env)
+{
+	/*
+	 * If destination CPU is idle/newly-idle and source has more than X
+	 * runnable CFS tasks, force a pull to avoid idle-while-runnable stalls.
+	 */
+	if (env->idle == CPU_NOT_IDLE)
+		return false;
+
+	return env->src_rq->cfs.h_nr_running > JC_IDLE_PULL_BACKLOG_THRESHOLD;
+}
+
 static inline int should_migrate_task(struct task_struct *p, struct lb_env *env,
 				      int *ml_confidence_permille,
 				      int *ml_margin_permille)
@@ -7196,6 +7210,9 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	int normal_decision;
 	int final_decision = 0;
 	bool used_normal_policy = true;
+#ifdef CONFIG_JC_SCHED
+	bool forced_idle_pull = false;
+#endif
 
 	env->test_aggressive = 0;
 	env->jc_should_call_count = 0;
@@ -7335,7 +7352,14 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		final_decision = normal_decision;
 		used_normal_policy = true;
 #endif
-		}
+	}
+
+	if (!used_normal_policy && jc_should_force_idle_pull(env)) {
+		forced_idle_pull = true;
+		final_decision = 1;
+		used_normal_policy = true;
+		env->jc_should_latency_source_mode = JC_SCHED_SOURCE_NORMAL;
+	}
 #endif
 
 	if (used_normal_policy) {
@@ -7344,6 +7368,14 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 				schedstat_inc(env->sd->lb_hot_gained[env->idle]);
 				schedstat_inc(p->se.statistics.nr_forced_migrations);
 			}
+#ifdef CONFIG_JC_SCHED
+			if (forced_idle_pull) {
+				pr_info_ratelimited("jc_sched: force_idle_pull pid=%d src_cpu=%d dst_cpu=%d idle=%d src_h_nr=%lu dst_nr=%u\n",
+						    p->pid, env->src_cpu, env->dst_cpu,
+						    env->idle, env->src_rq->cfs.h_nr_running,
+						    env->dst_rq->nr_running);
+			}
+#endif
 			return 1;
 		}
 		schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
