@@ -7314,12 +7314,20 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		used_normal_policy = true;
 #elif defined(CONFIG_JC_SCHED_REPLACE)
 		env->jc_should_latency_source_mode = JC_SCHED_SOURCE_ML;
-		final_decision = ml_decision;
+		/*
+		 * Hybrid safety policy:
+		 * - If ML allows, allow.
+		 * - If ML blocks, only block when normal policy also blocks.
+		 */
+		final_decision = ml_decision || normal_decision;
 		used_normal_policy = false;
 #elif defined(CONFIG_JC_SCHED_TOGGLE)
 		if (is_jc_sched) {
 			env->jc_should_latency_source_mode = JC_SCHED_SOURCE_ML;
-			final_decision = ml_decision;
+			/*
+			 * Same hybrid policy as REPLACE mode when ML is active.
+			 */
+			final_decision = ml_decision || normal_decision;
 			used_normal_policy = false;
 		} else {
 			env->jc_should_latency_source_mode = JC_SCHED_SOURCE_NORMAL;
