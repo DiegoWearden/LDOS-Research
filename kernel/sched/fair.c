@@ -6976,6 +6976,41 @@ struct lb_env {
 
 /* JC ML CFS LB*/
 #ifdef CONFIG_JC_SCHED
+#define JC_GUARD_SRC_CFS_BACKLOG_MIN	2UL
+#define JC_GUARD_HNR_IMBALANCE_MIN	2L
+#define JC_GUARD_ENV_IMBALANCE_MIN	1L
+
+static inline bool jc_should_fallback_on_concentration(const struct lb_env *env,
+						       int ml_decision)
+{
+	long src_h_nr;
+	long dst_h_nr;
+	long h_nr_delta;
+
+	/*
+	 * Guardrail is only relevant when ML blocks and we detect
+	 * concentration/stranding (idle dst while src still has backlog).
+	 */
+	if (ml_decision)
+		return false;
+
+	if (env->idle == CPU_NOT_IDLE)
+		return false;
+
+	src_h_nr = (long)env->src_rq->cfs.h_nr_running;
+	dst_h_nr = (long)env->dst_rq->cfs.h_nr_running;
+	h_nr_delta = src_h_nr - dst_h_nr;
+
+	if (src_h_nr < (long)JC_GUARD_SRC_CFS_BACKLOG_MIN)
+		return false;
+	if (h_nr_delta < JC_GUARD_HNR_IMBALANCE_MIN)
+		return false;
+	if (env->imbalance < JC_GUARD_ENV_IMBALANCE_MIN)
+		return false;
+
+	return true;
+}
+
 static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int src_nid, dst_nid;
@@ -7030,7 +7065,6 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
 
-#ifndef CONFIG_JC_SCHED_REPLACE
 /*
  * Is this task likely cache-hot:
  */
@@ -7122,7 +7156,26 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 	return -1;
 }
 #endif
-#endif  // JC_SCHED_REPLACE
+
+static inline int jc_normal_can_migrate_decision(struct task_struct *p,
+						 struct lb_env *env,
+						 int *tsk_cache_hot)
+{
+	int cache_hot;
+
+	cache_hot = migrate_degrades_locality(p, env);
+	if (cache_hot == -1)
+		cache_hot = task_hot(p, env);
+
+	if (tsk_cache_hot)
+		*tsk_cache_hot = cache_hot;
+
+	if (cache_hot <= 0 ||
+	    env->sd->nr_balance_failed > env->sd->cache_nice_tries)
+		return 1;
+
+	return 0;
+}
 
 /*
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
@@ -7193,8 +7246,31 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
     env->test_aggressive = 1;
 
 #ifdef CONFIG_JC_SCHED_REPLACE
-    /* printk("JC_SCHED_REPLACE"); */
-    return should_migrate_task(p, env);      
+	{
+		int ml_decision = should_migrate_task(p, env);
+
+#ifdef CONFIG_JC_SCHED
+		if (jc_should_fallback_on_concentration(env, ml_decision)) {
+			int normal_decision;
+
+			normal_decision = jc_normal_can_migrate_decision(p, env,
+								 &tsk_cache_hot);
+			if (normal_decision) {
+				if (tsk_cache_hot == 1) {
+					schedstat_inc(env->sd->lb_hot_gained[env->idle]);
+					schedstat_inc(p->se.statistics.nr_forced_migrations);
+				}
+				pr_info_ratelimited("jc_sched: guardrail_fallback pid=%d src_cpu=%d dst_cpu=%d idle=%d src_h_nr=%lu dst_h_nr=%lu env_imbalance=%ld ml=%d normal=%d\n",
+						    p->pid, env->src_cpu, env->dst_cpu,
+						    env->idle, env->src_rq->cfs.h_nr_running,
+						    env->dst_rq->cfs.h_nr_running, env->imbalance,
+						    ml_decision, normal_decision);
+			}
+			return normal_decision;
+		}
+#endif
+		return ml_decision;
+	}
 #else
 
 #ifdef CONFIG_JC_SCHED_TOGGLE
@@ -7212,12 +7288,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 2) task is cache cold, or
 	 * 3) too many balance attempts have failed.
 	 */
-	tsk_cache_hot = migrate_degrades_locality(p, env);
-	if (tsk_cache_hot == -1)
-		tsk_cache_hot = task_hot(p, env);
-
-	if (tsk_cache_hot <= 0 ||
-	    env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
+	if (jc_normal_can_migrate_decision(p, env, &tsk_cache_hot)) {
 		if (tsk_cache_hot == 1) {
 			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
 			schedstat_inc(p->se.statistics.nr_forced_migrations);
