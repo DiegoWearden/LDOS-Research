@@ -6976,6 +6976,114 @@ struct lb_env {
 
 /* JC ML CFS LB*/
 #ifdef CONFIG_JC_SCHED
+#define JC_GUARD_SRC_H_MIN			2UL
+#define JC_GUARD_H_GAP_MIN			2L
+#define JC_GUARD_ENV_IMBALANCE_MIN		1L
+#define JC_GUARD_NR_GAP_MIN			1L
+#define JC_GUARD_SCORE_INSTANT			6U
+#define JC_GUARD_STREAK_MIN			4U
+#define JC_GUARD_EWMA_DECAY			8U
+#define JC_GUARD_EWMA_TRIGGER_Q8		(4U << 8)
+#define JC_GUARD_FALLBACK_COOLDOWN		256U
+
+struct jc_guardrail_state {
+	u32 score_ewma_q8;
+	u16 block_streak;
+	u16 cooldown_left;
+};
+
+static DEFINE_PER_CPU(struct jc_guardrail_state, jc_guard_state);
+
+static inline int jc_guardrail_instant_score(const struct lb_env *env)
+{
+	unsigned long src_h_nr = env->src_rq->cfs.h_nr_running;
+	unsigned long dst_h_nr = env->dst_rq->cfs.h_nr_running;
+	long h_gap = (long)src_h_nr - (long)dst_h_nr;
+	long nr_gap = (long)env->src_rq->nr_running - (long)env->dst_rq->nr_running;
+	int score = 0;
+
+	/* Signs of stranding: idle destination + source backlog + imbalance. */
+	if (env->idle != CPU_NOT_IDLE)
+		score += 2;
+	if (src_h_nr >= JC_GUARD_SRC_H_MIN)
+		score += 1;
+	if (h_gap >= JC_GUARD_H_GAP_MIN)
+		score += 2;
+	if (env->imbalance >= JC_GUARD_ENV_IMBALANCE_MIN)
+		score += 1;
+	if (nr_gap >= JC_GUARD_NR_GAP_MIN)
+		score += 1;
+	if (env->sd->nr_balance_failed > env->sd->cache_nice_tries)
+		score += 1;
+
+	return score;
+}
+
+static inline bool jc_guardrail_should_fallback(const struct lb_env *env,
+						int ml_decision,
+						int *score_out,
+						u16 *streak_out,
+						u16 *cooldown_out,
+						u32 *ewma_q8_out)
+{
+	struct jc_guardrail_state *st;
+	u32 ewma;
+	int score;
+	bool trigger_now = false;
+
+	st = &per_cpu(jc_guard_state, env->src_cpu);
+
+	if (st->cooldown_left > 0) {
+		st->cooldown_left--;
+		if (score_out)
+			*score_out = 0;
+		if (streak_out)
+			*streak_out = st->block_streak;
+		if (cooldown_out)
+			*cooldown_out = st->cooldown_left;
+		if (ewma_q8_out)
+			*ewma_q8_out = st->score_ewma_q8;
+		return true;
+	}
+
+	score = jc_guardrail_instant_score(env);
+
+	if (ml_decision == 0) {
+		if (st->block_streak < (u16)0xFFFF)
+			st->block_streak++;
+	} else if (st->block_streak > 0) {
+		st->block_streak--;
+	}
+
+	/* EWMA in Q8 fixed-point to keep this path lightweight. */
+	ewma = st->score_ewma_q8;
+	ewma = (ewma * (JC_GUARD_EWMA_DECAY - 1) + ((u32)score << 8)) /
+	       JC_GUARD_EWMA_DECAY;
+	st->score_ewma_q8 = ewma;
+
+	if (ml_decision == 0) {
+		if ((u32)score >= JC_GUARD_SCORE_INSTANT)
+			trigger_now = true;
+		else if (st->block_streak >= JC_GUARD_STREAK_MIN &&
+			 ewma >= JC_GUARD_EWMA_TRIGGER_Q8)
+			trigger_now = true;
+	}
+
+	if (trigger_now)
+		st->cooldown_left = JC_GUARD_FALLBACK_COOLDOWN;
+
+	if (score_out)
+		*score_out = score;
+	if (streak_out)
+		*streak_out = st->block_streak;
+	if (cooldown_out)
+		*cooldown_out = st->cooldown_left;
+	if (ewma_q8_out)
+		*ewma_q8_out = ewma;
+
+	return trigger_now;
+}
+
 static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int src_nid, dst_nid;
@@ -7030,7 +7138,6 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
 
-#ifndef CONFIG_JC_SCHED_REPLACE
 /*
  * Is this task likely cache-hot:
  */
@@ -7122,7 +7229,26 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 	return -1;
 }
 #endif
-#endif  // JC_SCHED_REPLACE
+
+static inline int jc_normal_can_migrate_decision(struct task_struct *p,
+						 struct lb_env *env,
+						 int *tsk_cache_hot)
+{
+	int cache_hot;
+
+	cache_hot = migrate_degrades_locality(p, env);
+	if (cache_hot == -1)
+		cache_hot = task_hot(p, env);
+
+	if (tsk_cache_hot)
+		*tsk_cache_hot = cache_hot;
+
+	if (cache_hot <= 0 ||
+	    env->sd->nr_balance_failed > env->sd->cache_nice_tries)
+		return 1;
+
+	return 0;
+}
 
 /*
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
@@ -7193,8 +7319,42 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
     env->test_aggressive = 1;
 
 #ifdef CONFIG_JC_SCHED_REPLACE
-    /* printk("JC_SCHED_REPLACE"); */
-    return should_migrate_task(p, env);      
+	{
+		int ml_decision = should_migrate_task(p, env);
+		int guard_score = 0;
+		u16 guard_streak = 0;
+		u16 guard_cooldown = 0;
+		u32 guard_ewma_q8 = 0;
+
+		/*
+		 * REPLACE mode stays ML-only unless the guardrail
+		 * detects sustained stranding/concentration pressure.
+		 */
+		if (jc_guardrail_should_fallback(env, ml_decision,
+						 &guard_score, &guard_streak,
+						 &guard_cooldown, &guard_ewma_q8)) {
+			int normal_decision;
+
+			normal_decision = jc_normal_can_migrate_decision(p, env,
+								 &tsk_cache_hot);
+			if (normal_decision && tsk_cache_hot == 1) {
+				schedstat_inc(env->sd->lb_hot_gained[env->idle]);
+				schedstat_inc(p->se.statistics.nr_forced_migrations);
+			}
+
+			pr_info_ratelimited("jc_sched: guardrail_fallback pid=%d src_cpu=%d dst_cpu=%d idle=%d src_h_nr=%lu dst_h_nr=%lu src_nr=%u dst_nr=%u env_imbalance=%ld score=%d streak=%u ewma_q8=%u cooldown=%u ml=%d normal=%d\n",
+					    p->pid, env->src_cpu, env->dst_cpu,
+					    env->idle, env->src_rq->cfs.h_nr_running,
+					    env->dst_rq->cfs.h_nr_running,
+					    env->src_rq->nr_running, env->dst_rq->nr_running,
+					    env->imbalance, guard_score, guard_streak,
+					    guard_ewma_q8, guard_cooldown,
+					    ml_decision, normal_decision);
+			return normal_decision;
+		}
+
+		return ml_decision;
+	}
 #else
 
 #ifdef CONFIG_JC_SCHED_TOGGLE
@@ -7212,12 +7372,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 2) task is cache cold, or
 	 * 3) too many balance attempts have failed.
 	 */
-	tsk_cache_hot = migrate_degrades_locality(p, env);
-	if (tsk_cache_hot == -1)
-		tsk_cache_hot = task_hot(p, env);
-
-	if (tsk_cache_hot <= 0 ||
-	    env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
+	if (jc_normal_can_migrate_decision(p, env, &tsk_cache_hot)) {
 		if (tsk_cache_hot == 1) {
 			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
 			schedstat_inc(p->se.statistics.nr_forced_migrations);
