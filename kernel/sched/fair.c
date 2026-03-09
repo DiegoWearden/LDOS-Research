@@ -6972,6 +6972,19 @@ struct lb_env {
 	struct list_head	tasks;
 
     unsigned int test_aggressive; // JC
+	unsigned int jc_should_call_count;
+	u64 jc_should_total_ns;
+	u64 jc_should_max_ns;
+	int jc_should_latency_source_mode;
+	int jc_ml_can_migrate_decision;
+	int jc_normal_can_migrate_decision;
+	unsigned int jc_decision_mismatch;
+	unsigned int jc_fail_reason;
+	int jc_ml_confidence_permille;
+	int jc_ml_margin_permille;
+	unsigned int jc_fallback_used;
+	unsigned int jc_fallback_triggered;
+	unsigned int jc_fallback_cooldown_left;
 };
 
 /* JC ML CFS LB*/
@@ -7024,7 +7037,8 @@ static inline bool jc_guardrail_should_fallback(const struct lb_env *env,
 						int *score_out,
 						u16 *streak_out,
 						u16 *cooldown_out,
-						u32 *ewma_q8_out)
+						u32 *ewma_q8_out,
+						int *fallback_mode_out)
 {
 	struct jc_guardrail_state *st;
 	u32 ewma;
@@ -7035,6 +7049,8 @@ static inline bool jc_guardrail_should_fallback(const struct lb_env *env,
 
 	if (st->cooldown_left > 0) {
 		st->cooldown_left--;
+		if (fallback_mode_out)
+			*fallback_mode_out = 1; /* existing cooldown fallback */
 		if (score_out)
 			*score_out = 0;
 		if (streak_out)
@@ -7071,6 +7087,8 @@ static inline bool jc_guardrail_should_fallback(const struct lb_env *env,
 
 	if (trigger_now)
 		st->cooldown_left = JC_GUARD_FALLBACK_COOLDOWN;
+	if (fallback_mode_out)
+		*fallback_mode_out = trigger_now ? 2 : 0;
 
 	if (score_out)
 		*score_out = score;
@@ -7264,6 +7282,19 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #endif
 
     env->test_aggressive = 0;
+	env->jc_should_call_count = 1;
+	env->jc_should_total_ns = 0;
+	env->jc_should_max_ns = 0;
+	env->jc_should_latency_source_mode = 0;
+	env->jc_ml_can_migrate_decision = -1;
+	env->jc_normal_can_migrate_decision = -1;
+	env->jc_decision_mismatch = 0;
+	env->jc_fail_reason = 0;
+	env->jc_ml_confidence_permille = -1;
+	env->jc_ml_margin_permille = -1;
+	env->jc_fallback_used = 0;
+	env->jc_fallback_triggered = 0;
+	env->jc_fallback_cooldown_left = 0;
 
     lockdep_assert_held(&env->src_rq->lock);
 
@@ -7275,8 +7306,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 3) running (obviously), or
 	 * 4) are cache-hot on their current CPU.
 	 */
-	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu))
+	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu)) {
+		env->jc_fail_reason = 1; /* throttled */
 		return 0;
+	}
 
 	if (!cpumask_test_cpu(env->dst_cpu, &p->cpus_allowed)) {
 		int cpu;
@@ -7293,8 +7326,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		 * Avoid computing new_dst_cpu for NEWLY_IDLE or if we have
 		 * already computed one in current iteration.
 		 */
-		if (env->idle == CPU_NEWLY_IDLE || (env->flags & LBF_DST_PINNED))
+		if (env->idle == CPU_NEWLY_IDLE || (env->flags & LBF_DST_PINNED)) {
+			env->jc_fail_reason = 2; /* affinity */
 			return 0;
+		}
 
 		/* Prevent to re-select dst_cpu via env's cpus */
 		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
@@ -7305,6 +7340,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 			}
 		}
 
+		env->jc_fail_reason = 2; /* affinity */
 		return 0;
 	}
 
@@ -7313,6 +7349,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 	if (task_running(env->src_rq, p)) {
 		schedstat_inc(p->se.statistics.nr_failed_migrations_running);
+		env->jc_fail_reason = 3; /* running */
 		return 0;
 	}
 
@@ -7325,6 +7362,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		u16 guard_streak = 0;
 		u16 guard_cooldown = 0;
 		u32 guard_ewma_q8 = 0;
+		int fallback_mode = 0;
+
+		env->jc_should_latency_source_mode = 1; /* ml */
+		env->jc_ml_can_migrate_decision = ml_decision;
 
 		/*
 		 * REPLACE mode stays ML-only unless the guardrail
@@ -7332,11 +7373,21 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		 */
 		if (jc_guardrail_should_fallback(env, ml_decision,
 						 &guard_score, &guard_streak,
-						 &guard_cooldown, &guard_ewma_q8)) {
+						 &guard_cooldown, &guard_ewma_q8,
+						 &fallback_mode)) {
 			int normal_decision;
 
 			normal_decision = jc_normal_can_migrate_decision(p, env,
 								 &tsk_cache_hot);
+			env->jc_should_latency_source_mode = 2; /* baseline */
+			env->jc_normal_can_migrate_decision = normal_decision;
+			env->jc_decision_mismatch =
+				(ml_decision != normal_decision) ? 1 : 0;
+			env->jc_fallback_used = 1;
+			env->jc_fallback_triggered = (fallback_mode == 2) ? 1 : 0;
+			env->jc_fallback_cooldown_left = guard_cooldown;
+			env->jc_fail_reason = normal_decision ? 0 : 4; /* normal blocked */
+
 			if (normal_decision && tsk_cache_hot == 1) {
 				schedstat_inc(env->sd->lb_hot_gained[env->idle]);
 				schedstat_inc(p->se.statistics.nr_forced_migrations);
@@ -7353,18 +7404,27 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 			return normal_decision;
 		}
 
+		env->jc_fallback_cooldown_left = guard_cooldown;
+		env->jc_fail_reason = ml_decision ? 0 : 5; /* ml blocked */
 		return ml_decision;
 	}
 #else
 
 #ifdef CONFIG_JC_SCHED_TOGGLE
-    if (is_jc_sched)
-        return should_migrate_task(p, env);
+    if (is_jc_sched) {
+		int jc_decision = should_migrate_task(p, env);
+		env->jc_should_latency_source_mode = 1; /* ml */
+		env->jc_ml_can_migrate_decision = jc_decision;
+		env->jc_fail_reason = jc_decision ? 0 : 5; /* ml blocked */
+        return jc_decision;
+	}
 #endif
 
 #ifdef CONFIG_JC_SCHED_TEST
     t_ori = ktime_get_ns();
 #endif
+
+	env->jc_should_latency_source_mode = 2; /* baseline */
 
 	/*
 	 * Aggressive migration if:
@@ -7373,6 +7433,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 3) too many balance attempts have failed.
 	 */
 	if (jc_normal_can_migrate_decision(p, env, &tsk_cache_hot)) {
+		env->jc_normal_can_migrate_decision = 1;
 		if (tsk_cache_hot == 1) {
 			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
 			schedstat_inc(p->se.statistics.nr_forced_migrations);
@@ -7383,6 +7444,8 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
         return 1;
 #endif
     }
+	env->jc_normal_can_migrate_decision = 0;
+	env->jc_fail_reason = 4; /* normal blocked */
 
 #ifdef CONFIG_JC_SCHED_TEST
     t_ori = ktime_get_ns() - t_ori;
