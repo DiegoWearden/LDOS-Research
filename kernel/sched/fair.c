@@ -6971,11 +6971,276 @@ struct lb_env {
 	enum fbq_type		fbq_type;
 	struct list_head	tasks;
 
-    unsigned int test_aggressive; // JC
+	unsigned int test_aggressive; // JC
+	unsigned int jc_should_call_count;
+	u64 jc_should_total_ns;
+	u64 jc_should_max_ns;
+	int jc_should_latency_source_mode;
+	int jc_ml_can_migrate_decision;
+	int jc_normal_can_migrate_decision;
+	unsigned int jc_decision_mismatch;
+	unsigned int jc_fail_reason;
+	int jc_ml_confidence_permille;
+	int jc_ml_margin_permille;
+	unsigned int jc_fallback_used;
+	unsigned int jc_fallback_triggered;
+	unsigned int jc_fallback_cooldown_left;
 };
 
 /* JC ML CFS LB*/
 #ifdef CONFIG_JC_SCHED
+#define JC_GUARD_TOPK				10U
+#define JC_GUARD_BOTTOMK			10U
+#define JC_GUARD_CV_THRESH_PCT			34U
+#define JC_GUARD_GAP_THRESH_PCT			55U
+#define JC_GUARD_IDLE_RISE_THRESH_PCT		8U
+#define JC_GUARD_CAN_DROP_THRESH_PCT		14U
+#define JC_GUARD_STREAK_MIN			3U
+#define JC_GUARD_FALLBACK_COOLDOWN		256U
+#define JC_GUARD_WARMUP_SAMPLES			128U
+#define JC_GUARD_FAST_DECAY			8U
+#define JC_GUARD_SLOW_DECAY			64U
+
+struct jc_guardrail_snapshot {
+	u16 top_bottom_gap_pct;
+	u8 cv_ge_thresh;
+};
+
+struct jc_guardrail_state {
+	u32 can_fast_q10;
+	u32 can_slow_q10;
+	u32 idle_fast_q10;
+	u32 idle_slow_q10;
+	u16 streak;
+	u16 cooldown_left;
+	u32 samples;
+};
+
+static DEFINE_PER_CPU(struct jc_guardrail_state, jc_guard_state);
+
+static inline u16 jc_guard_cpu_util_pct(int cpu)
+{
+	unsigned long util = cpu_rq(cpu)->cfs.avg.util_avg;
+
+	if (util > SCHED_CAPACITY_SCALE)
+		util = SCHED_CAPACITY_SCALE;
+
+	return (u16)((util * 100UL + (SCHED_CAPACITY_SCALE / 2)) /
+		      SCHED_CAPACITY_SCALE);
+}
+
+static inline void jc_guard_insert_top(u16 *top, u16 v)
+{
+	int i;
+
+	for (i = 0; i < JC_GUARD_TOPK; i++) {
+		if (v > top[i]) {
+			int j;
+
+			for (j = JC_GUARD_TOPK - 1; j > i; j--)
+				top[j] = top[j - 1];
+			top[i] = v;
+			return;
+		}
+	}
+}
+
+static inline void jc_guard_insert_bottom(u16 *bottom, u16 v)
+{
+	int i;
+
+	for (i = 0; i < JC_GUARD_BOTTOMK; i++) {
+		if (v < bottom[i]) {
+			int j;
+
+			for (j = JC_GUARD_BOTTOMK - 1; j > i; j--)
+				bottom[j] = bottom[j - 1];
+			bottom[i] = v;
+			return;
+		}
+	}
+}
+
+static inline void jc_guardrail_snapshot(const struct lb_env *env,
+					 struct jc_guardrail_snapshot *out)
+{
+	u16 top[JC_GUARD_TOPK] = { 0 };
+	u16 bottom[JC_GUARD_BOTTOMK];
+	u32 count = 0;
+	u32 i;
+	u64 sum = 0;
+	u64 sum_sq = 0;
+	u64 top_sum = 0;
+	u64 bottom_sum = 0;
+	u64 left;
+	u64 lhs;
+	u64 rhs;
+	int cpu;
+	u32 top_n;
+	u32 bottom_n;
+
+	for (i = 0; i < JC_GUARD_BOTTOMK; i++)
+		bottom[i] = (u16)~0U;
+
+	out->top_bottom_gap_pct = 0;
+	out->cv_ge_thresh = 0;
+
+	if (!env || !env->cpus)
+		return;
+
+	for_each_cpu(cpu, env->cpus) {
+		u16 util_pct = jc_guard_cpu_util_pct(cpu);
+
+		count++;
+		sum += util_pct;
+		sum_sq += (u64)util_pct * (u64)util_pct;
+		jc_guard_insert_top(top, util_pct);
+		jc_guard_insert_bottom(bottom, util_pct);
+	}
+
+	if (!count || !sum)
+		return;
+
+	top_n = min_t(u32, count, JC_GUARD_TOPK);
+	bottom_n = min_t(u32, count, JC_GUARD_BOTTOMK);
+	for (i = 0; i < top_n; i++)
+		top_sum += top[i];
+	for (i = 0; i < bottom_n; i++)
+		bottom_sum += bottom[i];
+
+	if (top_n && bottom_n) {
+		u32 top_mean = div64_u64(top_sum, top_n);
+		u32 bottom_mean = div64_u64(bottom_sum, bottom_n);
+
+		out->top_bottom_gap_pct = (top_mean > bottom_mean) ?
+					  (top_mean - bottom_mean) : 0;
+	}
+
+	/*
+	 * CV >= threshold, squared form to avoid sqrt:
+	 * ((sum_sq * n) - sum^2) / sum^2 >= (thr/100)^2
+	 */
+	left = sum_sq * count;
+	if (left <= (sum * sum))
+		return;
+
+	lhs = (left - (sum * sum)) * 10000ULL;
+	rhs = (sum * sum) * JC_GUARD_CV_THRESH_PCT * JC_GUARD_CV_THRESH_PCT;
+	if (lhs >= rhs)
+		out->cv_ge_thresh = 1;
+}
+
+static inline u32 jc_guard_ewma_step(u32 prev, u32 sample, u32 decay)
+{
+	s32 delta;
+
+	if (!prev)
+		return sample;
+
+	delta = (s32)sample - (s32)prev;
+	return prev + div_s32(delta, (s32)decay);
+}
+
+static inline bool jc_guardrail_should_fallback(const struct lb_env *env,
+						int ml_decision,
+						u16 *gap_pct_out,
+						u16 *cv_ge_out,
+						u16 *can_drop_pp_out,
+						u16 *idle_rise_pp_out,
+						u16 *streak_out,
+						u16 *cooldown_out,
+						int *fallback_mode_out)
+{
+	struct jc_guardrail_state *st;
+	struct jc_guardrail_snapshot snap = { 0 };
+	u32 can_sample_q10;
+	u32 idle_sample_q10;
+	u16 can_drop_pp = 0;
+	u16 idle_rise_pp = 0;
+	bool pressure_now = false;
+	bool trigger_now = false;
+
+	st = &per_cpu(jc_guard_state, env->src_cpu);
+
+	if (st->cooldown_left > 0) {
+		st->cooldown_left--;
+		if (fallback_mode_out)
+			*fallback_mode_out = 1; /* existing cooldown fallback */
+		if (gap_pct_out)
+			*gap_pct_out = 0;
+		if (cv_ge_out)
+			*cv_ge_out = 0;
+		if (can_drop_pp_out)
+			*can_drop_pp_out = 0;
+		if (idle_rise_pp_out)
+			*idle_rise_pp_out = 0;
+		if (streak_out)
+			*streak_out = st->streak;
+		if (cooldown_out)
+			*cooldown_out = st->cooldown_left;
+		return true;
+	}
+
+	jc_guardrail_snapshot(env, &snap);
+
+	can_sample_q10 = (ml_decision == 1) ? 1024U : 0U;
+	idle_sample_q10 = (env->idle != CPU_NOT_IDLE) ? 1024U : 0U;
+
+	st->can_fast_q10 = jc_guard_ewma_step(st->can_fast_q10, can_sample_q10,
+					       JC_GUARD_FAST_DECAY);
+	st->can_slow_q10 = jc_guard_ewma_step(st->can_slow_q10, can_sample_q10,
+					       JC_GUARD_SLOW_DECAY);
+	st->idle_fast_q10 = jc_guard_ewma_step(st->idle_fast_q10, idle_sample_q10,
+						JC_GUARD_FAST_DECAY);
+	st->idle_slow_q10 = jc_guard_ewma_step(st->idle_slow_q10, idle_sample_q10,
+						JC_GUARD_SLOW_DECAY);
+	st->samples++;
+
+	if (st->can_slow_q10 > st->can_fast_q10)
+		can_drop_pp = div_u64(((u64)(st->can_slow_q10 - st->can_fast_q10) *
+				       100ULL + 512ULL), 1024ULL);
+
+	if (st->idle_fast_q10 > st->idle_slow_q10)
+		idle_rise_pp = div_u64(((u64)(st->idle_fast_q10 - st->idle_slow_q10) *
+					100ULL + 512ULL), 1024ULL);
+
+	pressure_now = (ml_decision == 0) &&
+		       (st->samples >= JC_GUARD_WARMUP_SAMPLES) &&
+		       (snap.cv_ge_thresh != 0) &&
+		       (snap.top_bottom_gap_pct >= JC_GUARD_GAP_THRESH_PCT) &&
+		       ((idle_rise_pp >= JC_GUARD_IDLE_RISE_THRESH_PCT) ||
+			(can_drop_pp >= JC_GUARD_CAN_DROP_THRESH_PCT));
+
+	if (pressure_now) {
+		if (st->streak < (u16)0xFFFF)
+			st->streak++;
+	} else {
+		st->streak = 0;
+	}
+
+	if (st->streak >= JC_GUARD_STREAK_MIN) {
+		trigger_now = true;
+		st->cooldown_left = JC_GUARD_FALLBACK_COOLDOWN;
+	}
+
+	if (fallback_mode_out)
+		*fallback_mode_out = trigger_now ? 2 : 0;
+	if (gap_pct_out)
+		*gap_pct_out = snap.top_bottom_gap_pct;
+	if (cv_ge_out)
+		*cv_ge_out = snap.cv_ge_thresh;
+	if (can_drop_pp_out)
+		*can_drop_pp_out = can_drop_pp;
+	if (idle_rise_pp_out)
+		*idle_rise_pp_out = idle_rise_pp;
+	if (streak_out)
+		*streak_out = st->streak;
+	if (cooldown_out)
+		*cooldown_out = st->cooldown_left;
+
+	return trigger_now;
+}
+
 static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int src_nid, dst_nid;
@@ -7029,8 +7294,10 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 }
 #endif
 
-
-#ifndef CONFIG_JC_SCHED_REPLACE
+/*
+ * Baseline scheduler decision helpers. These are reused by REPLACE-mode
+ * guardrail fallback so we can return to the native can_migrate decision.
+ */
 /*
  * Is this task likely cache-hot:
  */
@@ -7122,7 +7389,26 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 	return -1;
 }
 #endif
-#endif  // JC_SCHED_REPLACE
+
+static inline int jc_normal_can_migrate_decision(struct task_struct *p,
+						 struct lb_env *env,
+						 int *tsk_cache_hot)
+{
+	int cache_hot;
+
+	cache_hot = migrate_degrades_locality(p, env);
+	if (cache_hot == -1)
+		cache_hot = task_hot(p, env);
+
+	if (tsk_cache_hot)
+		*tsk_cache_hot = cache_hot;
+
+	if (cache_hot <= 0 ||
+	    env->sd->nr_balance_failed > env->sd->cache_nice_tries)
+		return 1;
+
+	return 0;
+}
 
 /*
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
@@ -7133,13 +7419,26 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	int tsk_cache_hot;
 
 #ifdef CONFIG_JC_SCHED_TEST
-    int ret = 0;         // JC
-    u64 t_ori;
+	int ret = 0;         // JC
+	u64 t_ori;
 #endif
 
-    env->test_aggressive = 0;
+	env->test_aggressive = 0;
+	env->jc_should_call_count = 0;
+	env->jc_should_total_ns = 0;
+	env->jc_should_max_ns = 0;
+	env->jc_should_latency_source_mode = 0;
+	env->jc_ml_can_migrate_decision = -1;
+	env->jc_normal_can_migrate_decision = -1;
+	env->jc_decision_mismatch = 0;
+	env->jc_fail_reason = 0;
+	env->jc_ml_confidence_permille = -1;
+	env->jc_ml_margin_permille = -1;
+	env->jc_fallback_used = 0;
+	env->jc_fallback_triggered = 0;
+	env->jc_fallback_cooldown_left = 0;
 
-    lockdep_assert_held(&env->src_rq->lock);
+	lockdep_assert_held(&env->src_rq->lock);
 
 
     /*
@@ -7150,12 +7449,16 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 4) are cache-hot on their current CPU.
 	 */
 	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu))
+	{
+		env->jc_fail_reason = 1; /* throttled */
 		return 0;
+	}
 
 	if (!cpumask_test_cpu(env->dst_cpu, &p->cpus_allowed)) {
 		int cpu;
 
 		schedstat_inc(p->se.statistics.nr_failed_migrations_affine);
+		env->jc_fail_reason = 2; /* affinity */
 
 		env->flags |= LBF_SOME_PINNED;
 
@@ -7187,23 +7490,95 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 	if (task_running(env->src_rq, p)) {
 		schedstat_inc(p->se.statistics.nr_failed_migrations_running);
+		env->jc_fail_reason = 3; /* running */
 		return 0;
 	}
 
-    env->test_aggressive = 1;
+	env->test_aggressive = 1;
 
 #ifdef CONFIG_JC_SCHED_REPLACE
-    /* printk("JC_SCHED_REPLACE"); */
-    return should_migrate_task(p, env);      
+	{
+		int ml_decision;
+		int normal_decision;
+		u64 ml_t0;
+		u16 guard_gap_pct = 0;
+		u16 guard_cv_ge = 0;
+		u16 guard_can_drop_pp = 0;
+		u16 guard_idle_rise_pp = 0;
+		u16 guard_streak = 0;
+		u16 guard_cooldown = 0;
+		int fallback_mode = 0;
+
+		ml_t0 = ktime_get_ns();
+		ml_decision = should_migrate_task(p, env);
+		ml_t0 = ktime_get_ns() - ml_t0;
+
+		env->jc_should_call_count = 1;
+		env->jc_should_total_ns = ml_t0;
+		env->jc_should_max_ns = ml_t0;
+		env->jc_should_latency_source_mode = 1; /* ml */
+		env->jc_ml_can_migrate_decision = ml_decision;
+
+		if (jc_guardrail_should_fallback(env, ml_decision,
+						 &guard_gap_pct,
+						 &guard_cv_ge,
+						 &guard_can_drop_pp,
+						 &guard_idle_rise_pp,
+						 &guard_streak,
+						 &guard_cooldown,
+						 &fallback_mode)) {
+			normal_decision = jc_normal_can_migrate_decision(p, env,
+								 &tsk_cache_hot);
+			env->jc_fallback_used = 1;
+			env->jc_fallback_triggered = (fallback_mode == 2) ? 1 : 0;
+			env->jc_fallback_cooldown_left = guard_cooldown;
+			env->jc_normal_can_migrate_decision = normal_decision;
+			env->jc_decision_mismatch = (ml_decision != normal_decision);
+			env->jc_should_latency_source_mode = 2; /* baseline */
+			if (!normal_decision)
+				env->jc_fail_reason = 4; /* normal blocked */
+
+			if (normal_decision && tsk_cache_hot == 1) {
+				schedstat_inc(env->sd->lb_hot_gained[env->idle]);
+				schedstat_inc(p->se.statistics.nr_forced_migrations);
+			}
+
+			pr_info_ratelimited("jc_sched: guardrail_fallback pid=%d src_cpu=%d dst_cpu=%d gap=%u cv_ge=%d can_drop_pp=%u idle_rise_pp=%u streak=%u cooldown=%u ml=%d normal=%d mode=%d\n",
+					    p->pid, env->src_cpu, env->dst_cpu,
+					    guard_gap_pct, guard_cv_ge,
+					    guard_can_drop_pp, guard_idle_rise_pp,
+					    guard_streak, guard_cooldown,
+					    ml_decision, normal_decision, fallback_mode);
+			return normal_decision;
+		}
+
+		env->jc_fallback_cooldown_left = guard_cooldown;
+		if (!ml_decision)
+			env->jc_fail_reason = 5; /* ml blocked */
+		return ml_decision;
+	}
 #else
 
 #ifdef CONFIG_JC_SCHED_TOGGLE
-    if (is_jc_sched)
-        return should_migrate_task(p, env);
+	if (is_jc_sched) {
+		u64 ml_t0 = ktime_get_ns();
+		int ml_decision = should_migrate_task(p, env);
+
+		ml_t0 = ktime_get_ns() - ml_t0;
+		env->jc_should_call_count = 1;
+		env->jc_should_total_ns = ml_t0;
+		env->jc_should_max_ns = ml_t0;
+		env->jc_should_latency_source_mode = 1; /* ml */
+		env->jc_ml_can_migrate_decision = ml_decision;
+		env->jc_normal_can_migrate_decision = -1;
+		if (!ml_decision)
+			env->jc_fail_reason = 5; /* ml blocked */
+		return ml_decision;
+	}
 #endif
 
 #ifdef CONFIG_JC_SCHED_TEST
-    t_ori = ktime_get_ns();
+	t_ori = ktime_get_ns();
 #endif
 
 	/*
@@ -7212,37 +7587,37 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 2) task is cache cold, or
 	 * 3) too many balance attempts have failed.
 	 */
-	tsk_cache_hot = migrate_degrades_locality(p, env);
-	if (tsk_cache_hot == -1)
-		tsk_cache_hot = task_hot(p, env);
-
-	if (tsk_cache_hot <= 0 ||
-	    env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
+	if (jc_normal_can_migrate_decision(p, env, &tsk_cache_hot)) {
+		env->jc_normal_can_migrate_decision = 1;
+		env->jc_should_latency_source_mode = 2; /* baseline */
 		if (tsk_cache_hot == 1) {
 			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
 			schedstat_inc(p->se.statistics.nr_forced_migrations);
-        }
+		}
 #ifdef CONFIG_JC_SCHED_TEST
-        ret = 1;
+		ret = 1;
 #else
-        return 1;
+		return 1;
 #endif
-    }
+	}
+	env->jc_normal_can_migrate_decision = 0;
+	env->jc_should_latency_source_mode = 2; /* baseline */
+	env->jc_fail_reason = 4; /* normal blocked */
 
 #ifdef CONFIG_JC_SCHED_TEST
-    t_ori = ktime_get_ns() - t_ori;
-    // JC
-    if (is_jc_sched) {
-        u64 t_jc = ktime_get_ns();
-        int jc_ret = should_migrate_task(p, env);      
-        t_jc = ktime_get_ns() - t_jc;
-        printk("can_migrate %d %d", ret, jc_ret);
-        printk("cm_time %llu %llu", t_ori, t_jc);
-    }
+	t_ori = ktime_get_ns() - t_ori;
+	// JC
+	if (is_jc_sched) {
+		u64 t_jc = ktime_get_ns();
+		int jc_ret = should_migrate_task(p, env);
+		t_jc = ktime_get_ns() - t_jc;
+		printk("can_migrate %d %d", ret, jc_ret);
+		printk("cm_time %llu %llu", t_ori, t_jc);
+	}
 	return ret;
 #else
 	schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
-    return 0;
+	return 0;
 #endif  // JC_SCHED_TEST
 
 #endif  // JC_SCHED_REPLACE
