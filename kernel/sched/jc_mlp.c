@@ -41,6 +41,12 @@ dtype b2[] = { ftod(0.405319) };
 
 int is_jc_sched = 0;
 EXPORT_SYMBOL(is_jc_sched);
+int jc_sched_transition_reason = JC_SCHED_REASON_UNSPECIFIED;
+EXPORT_SYMBOL(jc_sched_transition_reason);
+int jc_sched_log_next_ml_decision = 0;
+EXPORT_SYMBOL(jc_sched_log_next_ml_decision);
+int jc_sched_log_next_normal_decision = 0;
+EXPORT_SYMBOL(jc_sched_log_next_normal_decision);
 
 struct matrix {
     int nrow;
@@ -175,4 +181,3 @@ int jc_mlp_main(struct jc_lb_data *data) {
     return output;
 }
 #endif
-

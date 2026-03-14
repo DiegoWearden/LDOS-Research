@@ -7025,6 +7025,13 @@ static inline int should_migrate_task(struct task_struct *p, struct lb_env *env)
 
     data.total_faults = p->total_numa_faults;
 
+    if (READ_ONCE(jc_sched_log_next_ml_decision)) {
+        WRITE_ONCE(jc_sched_log_next_ml_decision, 0);
+        pr_info("jc_sched: ML scheduler active reason=%s src_cpu=%d dst_cpu=%d pid=%d comm=%s\n",
+            jc_sched_reason_name(READ_ONCE(jc_sched_transition_reason)),
+            env->src_cpu, env->dst_cpu, task_pid_nr(p), p->comm);
+    }
+
     return jc_mlp_main(&data);
 }
 #endif
@@ -7200,6 +7207,12 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 #ifdef CONFIG_JC_SCHED_TOGGLE
     if (is_jc_sched)
         return should_migrate_task(p, env);
+    if (READ_ONCE(jc_sched_log_next_normal_decision)) {
+        WRITE_ONCE(jc_sched_log_next_normal_decision, 0);
+        pr_info("jc_sched: normal scheduler path active reason=%s src_cpu=%d dst_cpu=%d pid=%d comm=%s\n",
+            jc_sched_reason_name(READ_ONCE(jc_sched_transition_reason)),
+            env->src_cpu, env->dst_cpu, task_pid_nr(p), p->comm);
+    }
 #endif
 
 #ifdef CONFIG_JC_SCHED_TEST

@@ -942,6 +942,6 @@ asmlinkage long sys_statx(int dfd, const char __user *path, unsigned flags,
 			  unsigned mask, struct statx __user *buffer);
 
 /* kernel/sched/jc_mlp.c */
-asmlinkage long sys_jc_sched(int start);
+asmlinkage long sys_jc_sched(int start, int reason);
 
 #endif

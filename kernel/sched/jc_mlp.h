@@ -4,6 +4,33 @@
 #include <linux/sched.h>
 
 extern int is_jc_sched;
+extern int jc_sched_transition_reason;
+extern int jc_sched_log_next_ml_decision;
+extern int jc_sched_log_next_normal_decision;
+
+enum jc_sched_reason {
+    JC_SCHED_REASON_UNSPECIFIED = 0,
+    JC_SCHED_REASON_RUN_START = 1,
+    JC_SCHED_REASON_GUARDRAIL_FALLBACK = 2,
+    JC_SCHED_REASON_RUN_END_CLEANUP = 3,
+    JC_SCHED_REASON_MANUAL = 4,
+};
+
+static inline const char *jc_sched_reason_name(int reason)
+{
+    switch (reason) {
+    case JC_SCHED_REASON_RUN_START:
+        return "run_start";
+    case JC_SCHED_REASON_GUARDRAIL_FALLBACK:
+        return "guardrail_fallback";
+    case JC_SCHED_REASON_RUN_END_CLEANUP:
+        return "run_end_cleanup";
+    case JC_SCHED_REASON_MANUAL:
+        return "manual";
+    default:
+        return "unspecified";
+    }
+}
 
 struct jc_lb_data {
     int src_non_pref;

@@ -5048,18 +5048,34 @@ void io_schedule(void)
 EXPORT_SYMBOL(io_schedule);
 
 // JC
-SYSCALL_DEFINE1(jc_sched, int, start)
+SYSCALL_DEFINE2(jc_sched, int, start, int, reason)
 {
 #ifdef CONFIG_JC_SCHED
-    if (start) {
-        is_jc_sched = 1;
-        printk("JC Sched Started.");
+    int enable = start ? 1 : 0;
+    int previous = READ_ONCE(is_jc_sched);
+    const char *reason_name = jc_sched_reason_name(reason);
+
+    if (reason < JC_SCHED_REASON_UNSPECIFIED || reason > JC_SCHED_REASON_MANUAL)
+        reason = JC_SCHED_REASON_UNSPECIFIED;
+    reason_name = jc_sched_reason_name(reason);
+
+    WRITE_ONCE(jc_sched_transition_reason, reason);
+
+    if (enable) {
+        WRITE_ONCE(is_jc_sched, 1);
+        WRITE_ONCE(jc_sched_log_next_ml_decision, 1);
+        WRITE_ONCE(jc_sched_log_next_normal_decision, 0);
+        pr_info("jc_sched: ML scheduler enabled reason=%s pid=%d comm=%s prev=%d\n",
+                reason_name, task_pid_nr(current), current->comm, previous);
     } else {
-        is_jc_sched = 0;
-        printk("JC Sched Stopped.");
+        WRITE_ONCE(is_jc_sched, 0);
+        WRITE_ONCE(jc_sched_log_next_normal_decision, 1);
+        WRITE_ONCE(jc_sched_log_next_ml_decision, 0);
+        pr_info("jc_sched: fallback to normal scheduler requested reason=%s pid=%d comm=%s prev=%d\n",
+                reason_name, task_pid_nr(current), current->comm, previous);
     }
 #else
-    printk("JC Sched not enabled");
+    pr_info("jc_sched: not enabled\n");
 #endif
 
     return 0;
